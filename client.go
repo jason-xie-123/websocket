@@ -337,7 +337,13 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 	defer func() {
 		if netConn != nil {
 			if err := netConn.Close(); err != nil {
-				log.Printf("websocket: failed to close network connection: %v", err)
+				// 此处需要对错误原因做额外的判断, 因为在使用 DialContext 进行 websocket 通讯的时候, 如果 context 被 cancel 了
+				// 再执行关闭操作, 会出现下面的错误
+				// failed to close network connection: close tcp 192.168.1.133:59227->119.145.148.43:443: use of closed network connection
+				// 这个错误对于我们来说没有意义, 是已知的错误, 且会暴露我们正在通讯的 IP 地址
+				if !strings.Contains(err.Error(), "use of closed network connection") {
+					log.Printf("websocket: failed to close network connection: %v", err)
+				}
 			}
 		}
 	}()

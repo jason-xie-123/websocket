@@ -7,6 +7,7 @@ package websocket
 import (
 	"bufio"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -1249,6 +1250,30 @@ func (c *Conn) SetCompressionLevel(level int) error {
 	}
 	c.compressionLevel = level
 	return nil
+}
+
+func (c *Conn) SetReadBuffer(bytes int) error {
+	tlsConn := c.conn.(*tls.Conn)
+	if tlsConn != nil {
+		tcpConn := tlsConn.NetConn().(*net.TCPConn)
+		if tcpConn != nil {
+			return tcpConn.SetReadBuffer(bytes)
+		}
+	}
+
+	return errors.New("no implement of SetReadBuffer for c.conn")
+}
+
+func (c *Conn) SetWriteBuffer(bytes int) error {
+	tlsConn := c.conn.(*tls.Conn)
+	if tlsConn != nil {
+		tcpConn := tlsConn.NetConn().(*net.TCPConn)
+		if tcpConn != nil {
+			return tcpConn.SetWriteBuffer(bytes)
+		}
+	}
+
+	return errors.New("no implement of SetWriteBuffer for c.conn")
 }
 
 // FormatCloseMessage formats closeCode and text as a WebSocket close message.

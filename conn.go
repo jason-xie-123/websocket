@@ -1071,7 +1071,7 @@ func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 		}
 
 		if frameType == TextMessage || frameType == BinaryMessage {
-			c.messageReader = &messageReader{c}
+			c.messageReader = getMessageReader(c)
 			c.reader = c.messageReader
 			if c.readDecompress {
 				c.reader = c.newDecompressionReader(c.reader)
@@ -1089,6 +1089,24 @@ func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 	}
 
 	return noFrame, nil, c.readErr
+}
+
+var messageReaderPool = sync.Pool{
+	New: func() interface{} {
+		return &messageReader{}
+	},
+}
+
+func getMessageReader(c *Conn) *messageReader {
+	reader := messageReaderPool.Get().(*messageReader)
+	reader.c = c
+
+	return reader
+}
+
+func putMessageReader(reader *messageReader) {
+	reader.c = nil
+	messageReaderPool.Put(reader)
 }
 
 type messageReader struct{ c *Conn }
@@ -1143,6 +1161,7 @@ func (r *messageReader) Read(b []byte) (int, error) {
 }
 
 func (r *messageReader) Close() error {
+	putMessageReader(r)
 	return nil
 }
 

@@ -253,8 +253,9 @@ type Conn struct {
 	subprotocol string
 
 	// Write fields
-	mu            chan struct{} // used as mutex to protect write to conn
-	writeBuf      []byte        // frame is constructed in this buffer.
+	mu            chan struct{}  // used as mutex to protect write to conn
+	writeBuf      []byte         // frame is constructed in this buffer.
+	writeBufData  *writePoolData // frame is constructed in this buffer.
 	writePool     BufferPool
 	writeBufSize  int
 	writeDeadline time.Time
@@ -513,11 +514,15 @@ func (c *Conn) beginMessage(mw *messageWriter, messageType int) error {
 	mw.pos = maxFrameHeaderSize
 
 	if c.writeBuf == nil {
-		wpd, ok := c.writePool.Get().(writePoolData)
+		wpd, ok := c.writePool.Get().(*writePoolData)
 		if ok {
 			c.writeBuf = wpd.buf
+			c.writeBufData = wpd
 		} else {
 			c.writeBuf = make([]byte, c.writeBufSize)
+			c.writeBufData = &writePoolData{
+				buf: c.writeBuf,
+			}
 		}
 	}
 	return nil
@@ -532,17 +537,28 @@ func (c *Conn) beginMessage(mw *messageWriter, messageType int) error {
 // All message types (TextMessage, BinaryMessage, CloseMessage, PingMessage and
 // PongMessage) are supported.
 func (c *Conn) NextWriter(messageType int) (io.WriteCloser, error) {
-	var mw messageWriter
-	if err := c.beginMessage(&mw, messageType); err != nil {
+	var mw *messageWriter = messageWriterPool.Get().(*messageWriter)
+	mw.compress = false
+	mw.pos = 0
+	mw.frameType = 0
+	mw.err = nil
+
+	if err := c.beginMessage(mw, messageType); err != nil {
 		return nil, err
 	}
-	c.writer = &mw
+	c.writer = mw
 	if c.newCompressionWriter != nil && c.enableWriteCompression && isData(messageType) {
 		w := c.newCompressionWriter(c.writer, c.compressionLevel)
 		mw.compress = true
 		c.writer = w
 	}
 	return c.writer, nil
+}
+
+var messageWriterPool = sync.Pool{
+	New: func() interface{} {
+		return &messageWriter{}
+	},
 }
 
 type messageWriter struct {
@@ -561,7 +577,7 @@ func (w *messageWriter) endMessage(err error) error {
 	w.err = err
 	c.writer = nil
 	if c.writePool != nil {
-		c.writePool.Put(writePoolData{buf: c.writeBuf})
+		c.writePool.Put(c.writeBufData)
 		c.writeBuf = nil
 	}
 	return err
@@ -744,7 +760,11 @@ func (w *messageWriter) Close() error {
 	if w.err != nil {
 		return w.err
 	}
-	return w.flushFrame(true, nil)
+	err := w.flushFrame(true, nil)
+
+	messageWriterPool.Put(w)
+
+	return err
 }
 
 // WritePreparedMessage writes prepared message into connection.
@@ -775,15 +795,23 @@ func (c *Conn) WriteMessage(messageType int, data []byte) error {
 
 	if c.isServer && (c.newCompressionWriter == nil || !c.enableWriteCompression) {
 		// Fast path with no allocations and single frame.
+		var mw *messageWriter = messageWriterPool.Get().(*messageWriter)
+		mw.compress = false
+		mw.pos = 0
+		mw.frameType = 0
+		mw.err = nil
 
-		var mw messageWriter
-		if err := c.beginMessage(&mw, messageType); err != nil {
+		if err := c.beginMessage(mw, messageType); err != nil {
 			return err
 		}
 		n := copy(c.writeBuf[mw.pos:], data)
 		mw.pos += n
 		data = data[n:]
-		return mw.flushFrame(true, data)
+		err := mw.flushFrame(true, data)
+
+		messageWriterPool.Put(mw)
+
+		return err
 	}
 
 	w, err := c.NextWriter(messageType)

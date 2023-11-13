@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"gvisor.dev/gvisor/pkg/buffer"
 )
 
 const (
@@ -188,9 +190,9 @@ var (
 var maskRand = rand.Reader
 
 // newMaskKey returns a new 32 bit value for masking client frames.
-func newMaskKey() [4]byte {
-	var k [4]byte
-	_, _ = io.ReadFull(maskRand, k[:])
+func newMaskKey() *buffer.View {
+	var k *buffer.View = buffer.NewViewSizeWithTag("tag-',", 4)
+	_, _ = io.ReadFull(maskRand, k.AsSlice()[:])
 	return k
 }
 
@@ -444,9 +446,10 @@ func (c *Conn) WriteControl(messageType int, data []byte, deadline time.Time) er
 		buf = append(buf, data...)
 	} else {
 		key := newMaskKey()
-		buf = append(buf, key[:]...)
+		defer key.Release()
+		buf = append(buf, key.AsSlice()[:]...)
 		buf = append(buf, data...)
-		maskBytes(key, 0, buf[6:])
+		maskBytes([4]byte(key.AsSlice()), 0, buf[6:])
 	}
 
 	d := 1000 * time.Hour
@@ -634,8 +637,9 @@ func (w *messageWriter) flushFrame(final bool, extra []byte) error {
 
 	if !c.isServer {
 		key := newMaskKey()
-		copy(c.writeBuf[maxFrameHeaderSize-4:], key[:])
-		maskBytes(key, 0, c.writeBuf[maxFrameHeaderSize:w.pos])
+		defer key.Release()
+		copy(c.writeBuf[maxFrameHeaderSize-4:], key.AsSlice()[:])
+		maskBytes([4]byte(key.AsSlice()), 0, c.writeBuf[maxFrameHeaderSize:w.pos])
 		if len(extra) > 0 {
 			return w.endMessage(c.writeFatal(errors.New("websocket: internal error, extra used in client mode")))
 		}

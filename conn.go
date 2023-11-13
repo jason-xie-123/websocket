@@ -532,17 +532,28 @@ func (c *Conn) beginMessage(mw *messageWriter, messageType int) error {
 // All message types (TextMessage, BinaryMessage, CloseMessage, PingMessage and
 // PongMessage) are supported.
 func (c *Conn) NextWriter(messageType int) (io.WriteCloser, error) {
-	var mw messageWriter
-	if err := c.beginMessage(&mw, messageType); err != nil {
+	var mw *messageWriter = messageWriterPool.Get().(*messageWriter)
+	mw.compress = false
+	mw.pos = 0
+	mw.frameType = 0
+	mw.err = nil
+
+	if err := c.beginMessage(mw, messageType); err != nil {
 		return nil, err
 	}
-	c.writer = &mw
+	c.writer = mw
 	if c.newCompressionWriter != nil && c.enableWriteCompression && isData(messageType) {
 		w := c.newCompressionWriter(c.writer, c.compressionLevel)
 		mw.compress = true
 		c.writer = w
 	}
 	return c.writer, nil
+}
+
+var messageWriterPool = sync.Pool{
+	New: func() interface{} {
+		return &messageWriter{}
+	},
 }
 
 type messageWriter struct {
@@ -744,7 +755,11 @@ func (w *messageWriter) Close() error {
 	if w.err != nil {
 		return w.err
 	}
-	return w.flushFrame(true, nil)
+	err := w.flushFrame(true, nil)
+
+	messageWriterPool.Put(w)
+
+	return err
 }
 
 // WritePreparedMessage writes prepared message into connection.
@@ -775,15 +790,23 @@ func (c *Conn) WriteMessage(messageType int, data []byte) error {
 
 	if c.isServer && (c.newCompressionWriter == nil || !c.enableWriteCompression) {
 		// Fast path with no allocations and single frame.
+		var mw *messageWriter = messageWriterPool.Get().(*messageWriter)
+		mw.compress = false
+		mw.pos = 0
+		mw.frameType = 0
+		mw.err = nil
 
-		var mw messageWriter
-		if err := c.beginMessage(&mw, messageType); err != nil {
+		if err := c.beginMessage(mw, messageType); err != nil {
 			return err
 		}
 		n := copy(c.writeBuf[mw.pos:], data)
 		mw.pos += n
 		data = data[n:]
-		return mw.flushFrame(true, data)
+		err := mw.flushFrame(true, data)
+
+		messageWriterPool.Put(mw)
+
+		return err
 	}
 
 	w, err := c.NextWriter(messageType)

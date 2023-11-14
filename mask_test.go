@@ -58,9 +58,10 @@ func BenchmarkMaskBytes(b *testing.B) {
 					} {
 						b.Run(fn.name, func(b *testing.B) {
 							key := newMaskKey()
+							defer key.Release()
 							data := make([]byte, size+align)[align:]
 							for i := 0; i < b.N; i++ {
-								fn.fn(key, 0, data)
+								fn.fn([4]byte(key.AsSlice()), 0, data)
 							}
 							b.SetBytes(int64(len(data)))
 						})

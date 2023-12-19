@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"gvisor.dev/gvisor/pkg/buffer"
 )
 
 const (
@@ -188,9 +190,9 @@ var (
 var maskRand = rand.Reader
 
 // newMaskKey returns a new 32 bit value for masking client frames.
-func newMaskKey() [4]byte {
-	var k [4]byte
-	_, _ = io.ReadFull(maskRand, k[:])
+func newMaskKey() *buffer.View {
+	var k *buffer.View = buffer.NewViewSizeWithTag("tag-',", 4)
+	_, _ = io.ReadFull(maskRand, k.AsSlice()[:])
 	return k
 }
 
@@ -253,8 +255,9 @@ type Conn struct {
 	subprotocol string
 
 	// Write fields
-	mu            chan struct{} // used as mutex to protect write to conn
-	writeBuf      []byte        // frame is constructed in this buffer.
+	mu            chan struct{}  // used as mutex to protect write to conn
+	writeBuf      []byte         // frame is constructed in this buffer.
+	writeBufData  *writePoolData // frame is constructed in this buffer.
 	writePool     BufferPool
 	writeBufSize  int
 	writeDeadline time.Time
@@ -443,9 +446,10 @@ func (c *Conn) WriteControl(messageType int, data []byte, deadline time.Time) er
 		buf = append(buf, data...)
 	} else {
 		key := newMaskKey()
-		buf = append(buf, key[:]...)
+		defer key.Release()
+		buf = append(buf, key.AsSlice()[:]...)
 		buf = append(buf, data...)
-		maskBytes(key, 0, buf[6:])
+		maskBytes([4]byte(key.AsSlice()), 0, buf[6:])
 	}
 
 	d := 1000 * time.Hour
@@ -513,11 +517,15 @@ func (c *Conn) beginMessage(mw *messageWriter, messageType int) error {
 	mw.pos = maxFrameHeaderSize
 
 	if c.writeBuf == nil {
-		wpd, ok := c.writePool.Get().(writePoolData)
+		wpd, ok := c.writePool.Get().(*writePoolData)
 		if ok {
 			c.writeBuf = wpd.buf
+			c.writeBufData = wpd
 		} else {
 			c.writeBuf = make([]byte, c.writeBufSize)
+			c.writeBufData = &writePoolData{
+				buf: c.writeBuf,
+			}
 		}
 	}
 	return nil
@@ -532,17 +540,28 @@ func (c *Conn) beginMessage(mw *messageWriter, messageType int) error {
 // All message types (TextMessage, BinaryMessage, CloseMessage, PingMessage and
 // PongMessage) are supported.
 func (c *Conn) NextWriter(messageType int) (io.WriteCloser, error) {
-	var mw messageWriter
-	if err := c.beginMessage(&mw, messageType); err != nil {
+	var mw *messageWriter = messageWriterPool.Get().(*messageWriter)
+	mw.compress = false
+	mw.pos = 0
+	mw.frameType = 0
+	mw.err = nil
+
+	if err := c.beginMessage(mw, messageType); err != nil {
 		return nil, err
 	}
-	c.writer = &mw
+	c.writer = mw
 	if c.newCompressionWriter != nil && c.enableWriteCompression && isData(messageType) {
 		w := c.newCompressionWriter(c.writer, c.compressionLevel)
 		mw.compress = true
 		c.writer = w
 	}
 	return c.writer, nil
+}
+
+var messageWriterPool = sync.Pool{
+	New: func() interface{} {
+		return &messageWriter{}
+	},
 }
 
 type messageWriter struct {
@@ -561,7 +580,7 @@ func (w *messageWriter) endMessage(err error) error {
 	w.err = err
 	c.writer = nil
 	if c.writePool != nil {
-		c.writePool.Put(writePoolData{buf: c.writeBuf})
+		c.writePool.Put(c.writeBufData)
 		c.writeBuf = nil
 	}
 	return err
@@ -618,8 +637,9 @@ func (w *messageWriter) flushFrame(final bool, extra []byte) error {
 
 	if !c.isServer {
 		key := newMaskKey()
-		copy(c.writeBuf[maxFrameHeaderSize-4:], key[:])
-		maskBytes(key, 0, c.writeBuf[maxFrameHeaderSize:w.pos])
+		defer key.Release()
+		copy(c.writeBuf[maxFrameHeaderSize-4:], key.AsSlice()[:])
+		maskBytes([4]byte(key.AsSlice()), 0, c.writeBuf[maxFrameHeaderSize:w.pos])
 		if len(extra) > 0 {
 			return w.endMessage(c.writeFatal(errors.New("websocket: internal error, extra used in client mode")))
 		}
@@ -744,7 +764,11 @@ func (w *messageWriter) Close() error {
 	if w.err != nil {
 		return w.err
 	}
-	return w.flushFrame(true, nil)
+	err := w.flushFrame(true, nil)
+
+	messageWriterPool.Put(w)
+
+	return err
 }
 
 // WritePreparedMessage writes prepared message into connection.
@@ -775,15 +799,23 @@ func (c *Conn) WriteMessage(messageType int, data []byte) error {
 
 	if c.isServer && (c.newCompressionWriter == nil || !c.enableWriteCompression) {
 		// Fast path with no allocations and single frame.
+		var mw *messageWriter = messageWriterPool.Get().(*messageWriter)
+		mw.compress = false
+		mw.pos = 0
+		mw.frameType = 0
+		mw.err = nil
 
-		var mw messageWriter
-		if err := c.beginMessage(&mw, messageType); err != nil {
+		if err := c.beginMessage(mw, messageType); err != nil {
 			return err
 		}
 		n := copy(c.writeBuf[mw.pos:], data)
 		mw.pos += n
 		data = data[n:]
-		return mw.flushFrame(true, data)
+		err := mw.flushFrame(true, data)
+
+		messageWriterPool.Put(mw)
+
+		return err
 	}
 
 	w, err := c.NextWriter(messageType)
@@ -1039,7 +1071,7 @@ func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 		}
 
 		if frameType == TextMessage || frameType == BinaryMessage {
-			c.messageReader = &messageReader{c}
+			c.messageReader = getMessageReader(c)
 			c.reader = c.messageReader
 			if c.readDecompress {
 				c.reader = c.newDecompressionReader(c.reader)
@@ -1057,6 +1089,24 @@ func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 	}
 
 	return noFrame, nil, c.readErr
+}
+
+var messageReaderPool = sync.Pool{
+	New: func() interface{} {
+		return &messageReader{}
+	},
+}
+
+func getMessageReader(c *Conn) *messageReader {
+	reader := messageReaderPool.Get().(*messageReader)
+	reader.c = c
+
+	return reader
+}
+
+func putMessageReader(reader *messageReader) {
+	reader.c = nil
+	messageReaderPool.Put(reader)
 }
 
 type messageReader struct{ c *Conn }
@@ -1111,6 +1161,7 @@ func (r *messageReader) Read(b []byte) (int, error) {
 }
 
 func (r *messageReader) Close() error {
+	putMessageReader(r)
 	return nil
 }
 
